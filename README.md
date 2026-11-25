@@ -1,6 +1,22 @@
 # Claude Code Context Window Fix
 
-Fixes the context usage ring in the official **Claude Code** VS Code extension (`anthropic.claude-code`) so it matches your actual auto-compact threshold, optionally appears immediately on new empty sessions, and displays exact token counts on hover.
+**Zero-setup fix** for the native context usage ring below the chat input box in the official **Claude Code** VS Code extension (`anthropic.claude-code`).
+
+No `statusLine` scripts, no hooks, no `jq`, and no bridge JSON files — just install and reload. It aligns the official ring directly with your real auto-compact threshold, shows exact token counts on hover, and can display `0 / limit` immediately on a brand-new empty session.
+
+## Before vs After
+
+Example with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=350000` on a `1M` model at `28.6k` used tokens:
+
+| | Ring % | Hover Tooltip | Empty New Session |
+| --- | --- | --- | --- |
+| **Native Claude Code** | `3%` (`28.6k / 967k`) | `97% of context remaining until auto-compact.` | Hidden until first reply |
+| **With This Extension** | `9%` (`28.6k / 317k`) | `91% of context remaining until auto-compact. (28.6k / 317k) · Model max 967k` | `0%` (`0 / 317k`, when threshold is `0`) |
+
+## Quick Start
+
+1. Install this extension alongside [`anthropic.claude-code`](https://marketplace.visualstudio.com/items?itemName=anthropic.claude-code) and reload VS Code when prompted.
+2. *(Recommended)* Set `"claudeCode.contextUsageThreshold": 0` in your VS Code settings if you want the ring visible from `0%` (Claude Code's built-in default is `50`, which hides the ring until usage exceeds `50%`).
 
 ## What Determines the 100% Progress Limit?
 
