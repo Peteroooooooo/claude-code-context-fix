@@ -2,7 +2,7 @@
   "name": "claude-code-context-fix",
   "displayName": "Claude Code Context Window Fix",
   "description": "Fixes Claude Code VS Code extension's context usage ring to respect CLAUDE_CODE_AUTO_COMPACT_WINDOW / autoCompactWindow, show before first reply, and display exact token counts.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "peteroooooooo",
   "license": "MIT",
   "repository": {
