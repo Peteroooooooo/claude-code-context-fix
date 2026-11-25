@@ -1,0 +1,91 @@
+{
+  "name": "claude-code-context-fix",
+  "displayName": "Claude Code Context Window Fix",
+  "description": "Fixes Claude Code VS Code extension's context usage ring to respect CLAUDE_CODE_AUTO_COMPACT_WINDOW / autoCompactWindow, show before first reply, and display exact token counts.",
+  "version": "1.0.0",
+  "publisher": "peteroooooooo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Peteroooooooo/claude-code-context-fix.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "context-window",
+    "auto-compact",
+    "tokens",
+    "anthropic"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "extensionDependencies": [
+    "anthropic.claude-code"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeCodeContextFix.enable",
+        "title": "Claude Code Context Fix: Enable"
+      },
+      {
+        "command": "claudeCodeContextFix.disable",
+        "title": "Claude Code Context Fix: Disable"
+      },
+      {
+        "command": "claudeCodeContextFix.reapply",
+        "title": "Claude Code Context Fix: Reapply Patch"
+      },
+      {
+        "command": "claudeCodeContextFix.status",
+        "title": "Claude Code Context Fix: Status"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Code Context Window Fix",
+      "properties": {
+        "claudeCodeContextFix.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "markdownDescription": "Enable patching the Claude Code VS Code extension's context usage indicator (`webview/index.js`)."
+        },
+        "claudeCodeContextFix.overrideWindow": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "scope": "application",
+          "markdownDescription": "Optional raw context window cap in tokens (e.g. `350000`) **before** Claude Code's `33k` buffer deduction (`min(maxOutputTokens, 20000) + 13000`, so `350000` displays as `317k`). Leave `0` to auto-resolve in priority order: `CLAUDE_CODE_AUTO_COMPACT_WINDOW` → `modelSettings.<model>.autoCompactWindow` → `autoCompactWindow` → model's native window (further lowered if `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is set)."
+        },
+        "claudeCodeContextFix.showTokenCounts": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "markdownDescription": "Include exact `used / effectiveLimit` token counts (and `Model max` when capped below the model window) in the context indicator hover tooltip."
+        },
+        "claudeCodeContextFix.showBeforeFirstReply": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "markdownDescription": "When `#claudeCode.contextUsageThreshold#` is `0`, show the ring immediately on a new empty session (`0 / limit`) instead of waiting for the first assistant reply."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test test/patcher.test.js",
+    "vscode:uninstall": "node ./uninstall-hook.js",
+    "package": "npx --yes @vscode/vsce package"
+  },
+  "dependencies": {
+    "acorn": "^8.19.0"
+  }
+}
