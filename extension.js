@@ -9,23 +9,22 @@ const {
   removePatchFromDir,
   getPatchStatus,
 } = require('./patcher');
+const { FILES_CHANGED_ERROR_CODE } = require('./patch-files');
 
 const OUTPUT = vscode.window.createOutputChannel('Claude Code Context Fix');
+const RETRY_DELAYS_MS = [1000, 3000, 8000, 15000];
+const TRANSIENT_FS_CODES = new Set([FILES_CHANGED_ERROR_CODE, 'EBUSY', 'EPERM', 'EACCES', 'ENOENT']);
 
 function log(msg) {
   OUTPUT.appendLine(`[${new Date().toISOString()}] ${msg}`);
 }
 
 function getTargetDirs() {
-  const dirs = new Set();
   const ext = vscode.extensions.getExtension('anthropic.claude-code');
-  if (ext && ext.extensionPath) {
-    dirs.add(ext.extensionPath);
+  if (ext && ext.extensionPath && fs.existsSync(path.join(ext.extensionPath, 'webview', 'index.js'))) {
+    return [ext.extensionPath];
   }
-  for (const d of findClaudeCodeExtDirs()) {
-    dirs.add(d);
-  }
-  return [...dirs];
+  return findClaudeCodeExtDirs();
 }
 
 function getPatchConfig() {
@@ -39,56 +38,31 @@ function getPatchConfig() {
   };
 }
 
-async function promptReload(message) {
-  const choice = await vscode.window.showInformationMessage(message, 'Reload Window');
-  if (choice === 'Reload Window') {
-    await vscode.commands.executeCommand('workbench.action.reloadWindow');
-  }
+function isTransientError(err) {
+  return Boolean(err && TRANSIENT_FS_CODES.has(err.code));
 }
 
-async function syncPatch({ interactive = false } = {}) {
-  const dirs = getTargetDirs();
-  if (dirs.length === 0) {
-    log('anthropic.claude-code extension directory not found.');
-    if (interactive) {
-      vscode.window.showWarningMessage('Claude Code extension (anthropic.claude-code) not found.');
-    }
-    return;
-  }
-
-  const config = getPatchConfig();
-  let anyChanged = false;
-
-  for (const dir of dirs) {
+async function promptReload(message, { autoReloadWebview = false } = {}) {
+  if (autoReloadWebview) {
     try {
-      if (config.enabled) {
-        const res = applyPatchToDir(dir, config);
-        log(`${res.status}: ${res.jsPath}`);
-        if (res.status === 'patched') anyChanged = true;
-      } else {
-        const res = removePatchFromDir(dir);
-        log(`remove -> ${res.status}: ${res.jsPath}`);
-        if (res.status === 'restored') anyChanged = true;
-      }
-    } catch (err) {
-      log(`ERROR (${dir}): ${err.stack || err.message}`);
-      if (interactive) {
-        vscode.window.showErrorMessage(`Claude Code Context Fix failed: ${err.message}`);
-      }
+      await vscode.commands.executeCommand('workbench.action.webview.reloadWebviewAction');
+    } catch {
+      // webview reload command may be unavailable if no webview is focused
     }
   }
-
-  if (anyChanged) {
-    const msg = config.enabled
-      ? 'Claude Code context indicator patch applied. Reload window for open tabs to pick up the change.'
-      : 'Claude Code context indicator patch removed. Reload window to restore original behavior.';
-    void promptReload(msg);
-  } else if (interactive) {
-    vscode.window.showInformationMessage(
-      config.enabled
-        ? 'Claude Code context indicator patch is already up to date.'
-        : 'Claude Code context indicator patch is disabled and clean.'
-    );
+  const choice = await vscode.window.showInformationMessage(
+    message,
+    'Reload Webview',
+    'Reload Window'
+  );
+  if (choice === 'Reload Webview') {
+    try {
+      await vscode.commands.executeCommand('workbench.action.webview.reloadWebviewAction');
+    } catch {
+      await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }
+  } else if (choice === 'Reload Window') {
+    await vscode.commands.executeCommand('workbench.action.reloadWindow');
   }
 }
 
@@ -96,39 +70,163 @@ function activate(context) {
   log('Activating Claude Code Context Fix...');
 
   let debounceTimer = null;
-  const scheduleSync = (delayMs = 500) => {
+  let retryTimer = null;
+  let lastNotifiedError = null;
+  let syncInFlight = false;
+  let pendingSyncOpts = null;
+
+  function clearTimers() {
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  }
+
+  async function runSync({ interactive = false, autoReloadWebview = false, attempt = 0 } = {}) {
+    if (syncInFlight) {
+      pendingSyncOpts = {
+        interactive: Boolean(pendingSyncOpts?.interactive || interactive),
+        autoReloadWebview: Boolean(pendingSyncOpts?.autoReloadWebview || autoReloadWebview),
+        attempt: 0,
+      };
+      return;
+    }
+
+    syncInFlight = true;
+    try {
+      const dirs = getTargetDirs();
+      if (dirs.length === 0) {
+        log('anthropic.claude-code extension directory not found.');
+        if (interactive) {
+          vscode.window.showWarningMessage('Claude Code extension (anthropic.claude-code) not found.');
+        }
+        return;
+      }
+
+      const config = getPatchConfig();
+      let anyChanged = false;
+      let retryNeeded = false;
+      const errors = [];
+
+      for (const dir of dirs) {
+        try {
+          if (config.enabled) {
+            const res = applyPatchToDir(dir, config);
+            log(`${res.status}: ${res.jsPath}`);
+            if (res.status === 'patched') anyChanged = true;
+          } else {
+            const res = removePatchFromDir(dir);
+            log(`remove -> ${res.status}: ${res.jsPath}`);
+            if (res.status === 'restored') anyChanged = true;
+          }
+        } catch (err) {
+          log(`ERROR (${dir}, attempt ${attempt + 1}): ${err.stack || err.message}`);
+          if (isTransientError(err) && attempt < RETRY_DELAYS_MS.length) {
+            retryNeeded = true;
+          } else {
+            errors.push(err);
+          }
+        }
+      }
+
+      if (errors.length === 0 && !retryNeeded) {
+        lastNotifiedError = null;
+      }
+
+      if (retryNeeded) {
+        const delay = RETRY_DELAYS_MS[attempt];
+        log(`Transient file change/lock; scheduling retry #${attempt + 2} in ${delay}ms.`);
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          void runSync({ interactive, autoReloadWebview, attempt: attempt + 1 });
+        }, delay);
+      } else if (errors.length > 0) {
+        const errMsg = errors[0].message || String(errors[0]);
+        if (interactive) {
+          const choice = await vscode.window.showErrorMessage(
+            `Claude Code Context Fix failed: ${errMsg}`,
+            'Show Log'
+          );
+          if (choice === 'Show Log') OUTPUT.show(true);
+        } else if (lastNotifiedError !== errMsg) {
+          lastNotifiedError = errMsg;
+          const choice = await vscode.window.showWarningMessage(
+            `Claude Code Context Fix could not patch Claude Code (${errMsg}). The context ring fell back to Claude Code's native behavior.`,
+            'Show Log',
+            'Retry'
+          );
+          if (choice === 'Show Log') {
+            OUTPUT.show(true);
+          } else if (choice === 'Retry') {
+            void runSync({ interactive: true, autoReloadWebview: true, attempt: 0 });
+          }
+        }
+      }
+
+      if (anyChanged) {
+        const msg = config.enabled
+          ? 'Claude Code context indicator patch applied. Reload webview or window if open tabs still show the old limit.'
+          : 'Claude Code context indicator patch removed. Reload webview or window to restore original behavior.';
+        void promptReload(msg, { autoReloadWebview });
+      } else if (interactive && errors.length === 0 && !retryNeeded) {
+        vscode.window.showInformationMessage(
+          config.enabled
+            ? 'Claude Code context indicator patch is already up to date.'
+            : 'Claude Code context indicator patch is disabled and clean.'
+        );
+      }
+    } finally {
+      syncInFlight = false;
+      if (pendingSyncOpts) {
+        const next = pendingSyncOpts;
+        pendingSyncOpts = null;
+        void runSync(next);
+      }
+    }
+  }
+
+  const scheduleSync = (delayMs = 500, opts = {}) => {
     if (debounceTimer) clearTimeout(debounceTimer);
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
-      void syncPatch({ interactive: false });
+      void runSync({ interactive: false, ...opts, attempt: 0 });
     }, delayMs);
   };
 
-  void syncPatch({ interactive: false });
+  void runSync({ interactive: false, autoReloadWebview: true, attempt: 0 });
 
   context.subscriptions.push(
-    vscode.extensions.onDidChange(() => scheduleSync(1000)),
+    vscode.extensions.onDidChange(() => scheduleSync(1000, { autoReloadWebview: true })),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('claudeCodeContextFix')) {
-        scheduleSync(200);
+        scheduleSync(200, { autoReloadWebview: false });
       }
     }),
     vscode.commands.registerCommand('claudeCodeContextFix.enable', async () => {
       await vscode.workspace
         .getConfiguration('claudeCodeContextFix')
         .update('enabled', true, vscode.ConfigurationTarget.Global);
-      await syncPatch({ interactive: true });
+      await runSync({ interactive: true, autoReloadWebview: true });
     }),
     vscode.commands.registerCommand('claudeCodeContextFix.disable', async () => {
       await vscode.workspace
         .getConfiguration('claudeCodeContextFix')
         .update('enabled', false, vscode.ConfigurationTarget.Global);
-      await syncPatch({ interactive: true });
+      await runSync({ interactive: true, autoReloadWebview: true });
     }),
     vscode.commands.registerCommand('claudeCodeContextFix.reapply', async () => {
-      await syncPatch({ interactive: true });
+      await runSync({ interactive: true, autoReloadWebview: true });
     }),
-    vscode.commands.registerCommand('claudeCodeContextFix.status', () => {
+    vscode.commands.registerCommand('claudeCodeContextFix.status', async () => {
       const dirs = getTargetDirs();
       const settings = readClaudeUserSettings();
       const cfg = vscode.workspace.getConfiguration('claudeCodeContextFix');
@@ -145,9 +243,19 @@ function activate(context) {
         settings.envAutoCompactWindow ||
         settings.autoCompactWindow ||
         'model default';
-      vscode.window.showInformationMessage(
-        `Context Fix: ${statuses.join('; ')} | Detected auto-compact window: ${detectedWin}`
+      const anyUnpatched = dirs.some((d) => !getPatchStatus(d).patched);
+      const buttons = anyUnpatched && cfg.get('enabled', true)
+        ? ['Reapply Patch', 'Show Log']
+        : ['Show Log'];
+      const choice = await vscode.window.showInformationMessage(
+        `Context Fix: ${statuses.join('; ')} | Auto-compact window: ${detectedWin}`,
+        ...buttons
       );
+      if (choice === 'Reapply Patch') {
+        await runSync({ interactive: true, autoReloadWebview: true });
+      } else if (choice === 'Show Log') {
+        OUTPUT.show(true);
+      }
     })
   );
 
@@ -158,7 +266,7 @@ function activate(context) {
     if (fs.existsSync(claudeDir)) {
       const watcher = fs.watch(claudeDir, (_event, filename) => {
         if (!filename || filename === 'settings.json') {
-          scheduleSync(500);
+          scheduleSync(500, { autoReloadWebview: false });
         }
       });
       context.subscriptions.push({ dispose: () => watcher.close() });
@@ -169,7 +277,7 @@ function activate(context) {
 
   context.subscriptions.push({
     dispose: () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
+      clearTimers();
     },
   });
 }
